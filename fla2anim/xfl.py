@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import re
+import struct
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path
 
 from .model import (
@@ -12,6 +14,8 @@ from .model import (
 )
 
 OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+ZIP_LOCAL_MAGIC = b"PK\x03\x04"
+ZIP_EMPTY_MAGIC = b"PK\x05\x06"
 
 
 class DirSource:
@@ -26,14 +30,80 @@ class DirSource:
             return None
 
 
+def _recover_entries(data):
+    """Rebuild {name: bytes} by walking local file headers.
+
+    Used when the zip central directory is missing or damaged (truncated or
+    interrupted copies, trailing junk). Entries that cannot be fully
+    decompressed are skipped.
+    """
+    files = {}
+    pos = data.find(ZIP_LOCAL_MAGIC)
+    while pos != -1 and pos + 30 <= len(data):
+        (_sig, _ver, _flags, method, _t, _d, _crc,
+         csize, _usize, nlen, elen) = struct.unpack("<4sHHHHHIIIHH", data[pos:pos + 30])
+        raw = data[pos + 30:pos + 30 + nlen]
+        try:
+            name = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            name = raw.decode("cp437", "replace")
+        start = pos + 30 + nlen + elen
+        consumed = 0
+        out = None
+        if method == 8:
+            d = zlib.decompressobj(-15)
+            try:
+                out = d.decompress(data[start:])
+                if d.eof:
+                    consumed = len(data) - start - len(d.unused_data)
+                else:
+                    out = None  # truncated stream: do not trust partial data
+            except zlib.error:
+                out = None
+        elif method == 0:
+            if csize:
+                out = data[start:start + csize]
+                consumed = csize
+            else:  # sizes live in a data descriptor: run to the next header
+                nxt = data.find(ZIP_LOCAL_MAGIC, start)
+                end = nxt if nxt != -1 else len(data)
+                out = data[start:end]
+                consumed = end - start
+        if out is not None and name and not name.endswith("/"):
+            files[name.replace("\\", "/")] = out
+        pos = data.find(ZIP_LOCAL_MAGIC, start + consumed)
+    return files
+
+
 class ZipSource:
     def __init__(self, path):
-        self.zf = zipfile.ZipFile(path)
-        self.names = {n.replace("\\", "/"): n for n in self.zf.namelist()}
+        self.recovered = False
+        self.zf = None
+        self._files = None
+        try:
+            self.zf = zipfile.ZipFile(path)
+            self.names = {n.replace("\\", "/"): n for n in self.zf.namelist()}
+        except zipfile.BadZipFile:
+            # Central directory missing/damaged: recover from local headers.
+            self._files = _recover_entries(Path(path).read_bytes())
+            if not any(n.lower().endswith(".xml") for n in self._files):
+                raise FlaError(
+                    f"{Path(path).name}: the zip archive is damaged and nothing usable could be "
+                    "recovered. It may be a truncated or interrupted copy; try copying it again, "
+                    "or re-save it from Adobe Animate as an uncompressed .xfl.") from None
+            self.names = {n: n for n in self._files}
+            self.recovered = True
 
     def read(self, name):
         real = self.names.get(name)
-        return self.zf.read(real) if real else None
+        if not real:
+            return None
+        if self._files is not None:
+            return self._files.get(real)
+        try:
+            return self.zf.read(real)
+        except (zipfile.BadZipFile, zlib.error, RuntimeError, NotImplementedError):
+            return None  # corrupt entry: treated like a missing one
 
 
 def open_source(path):
@@ -42,16 +112,17 @@ def open_source(path):
         raise FlaError(f"input not found: {p}")
     if p.is_dir():
         return DirSource(p)
-    if zipfile.is_zipfile(p):
-        return ZipSource(p)
-    head = p.read_bytes()[:8]
+    with p.open("rb") as f:
+        head = f.read(8)
     if head == OLE_MAGIC:
         raise UnsupportedFormatError(
-            "This is a legacy binary .fla (Flash 5 - CS4). That format is proprietary and "
-            "undocumented, so fla2anim cannot read it. Open it in Adobe Animate/Flash CS5+ "
-            "and use 'Save as' -> 'Flash CS5+ Uncompressed Document (*.xfl)' or a CS5+ .fla, "
-            "then convert that file."
+            "This is a legacy binary .fla (Flash 5 - CS4, including Flash 8). That format is "
+            "proprietary and undocumented, so fla2anim cannot read it. Open it in Adobe "
+            "Animate/Flash CS5+ and use 'Save as' -> 'Flash CS5+ Uncompressed Document "
+            "(*.xfl)' or a CS5+ .fla, then convert that file."
         )
+    if head[:4] in (ZIP_LOCAL_MAGIC, ZIP_EMPTY_MAGIC) or zipfile.is_zipfile(p):
+        return ZipSource(p)
     if p.suffix.lower() == ".xfl":
         return DirSource(p.parent)  # .xfl marker file next to DOMDocument.xml
     raise FlaError(f"{p.name}: not a recognised Flash project (expected a CS5+ .fla zip or .xfl folder)")
@@ -286,6 +357,9 @@ def load(path) -> Document:
         raise FlaError("DOMDocument.xml not found - this does not look like an XFL project")
     root = _parse_xml(raw, "DOMDocument.xml")
     doc = Document(reader=src)
+    if getattr(src, "recovered", False):
+        doc.warn("the zip directory was damaged; files were recovered from local headers "
+                 "and some assets may be missing")
     doc.width = _float(root.get("width"), 550.0)
     doc.height = _float(root.get("height"), 400.0)
     doc.fps = _float(root.get("frameRate"), 24.0) or 24.0

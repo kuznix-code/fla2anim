@@ -44,6 +44,7 @@ def build_parser():
     p.add_argument("--supersample", type=int, default=2, help="anti-aliasing factor for raster output (1-4)")
     p.add_argument("--info", action="store_true", help="print project info and exit")
     p.add_argument("--list-targets", action="store_true", help="list output formats and exit")
+    p.add_argument("--debug", action="store_true", help="show full Python tracebacks on unexpected errors")
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("-V", "--version", action="version", version=f"fla2anim {__version__}")
     return p
@@ -88,6 +89,12 @@ def main(argv=None):
     except ValueError as e:
         print(f"fla2anim: error: {e}", file=sys.stderr)
         return 2
+    except Exception as e:  # noqa: BLE001 - last-resort guard so users never see a raw traceback
+        if args.debug:
+            raise
+        print(f"fla2anim: error: unexpected failure: {type(e).__name__}: {e} "
+              "(re-run with --debug for a traceback)", file=sys.stderr)
+        return 1
     for w in doc.warnings:
         print(f"warning: {w}", file=sys.stderr)
     if not args.quiet:

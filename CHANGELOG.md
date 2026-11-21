@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+Bug-fix release.
+
+- Fix crash (raw `BadZipFile` traceback) on CS5+ `.fla` files whose zip central directory is damaged or
+  truncated. Entries are now recovered from the local file headers, with a warning.
+- Detect the input format by magic bytes before choosing a reader.
+- Clearer error for legacy binary `.fla` (Flash 5 - CS4, including Flash 8): still unsupported, now says so.
+- Unexpected errors now print a one-line message instead of a traceback; add `--debug` for the full traceback.
+
 ## 0.1.0
 First release.
 
